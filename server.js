@@ -108,6 +108,7 @@ app.use((req, res, next) => {
     `http://127.0.0.1:5501`,
     `http://localhost:${PORT}`,
     `http://127.0.0.1:${PORT}`,
+    "https://medi-go-frontend.vercel.app",
   ]);
 
   if (origin && allowedOrigins.has(origin)) {
