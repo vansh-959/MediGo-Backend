@@ -477,14 +477,17 @@ app.post("/api/auth/forgot-password", async (req, res) => {
     success: true,
     message: "If an account exists, a password-reset OTP has been sent.",
   };
-  if (!/^\S+@\S+\.\S+$/.test(normalizedEmail)) return res.json(genericResponse);
-
-  if (!mailTransport || !mailFrom) {
+  // Check service availability before looking up an account so this failure
+  // response cannot reveal whether a specific email is registered.
+  if (!mailTransport || !mailFrom || smtpStatus !== "connected") {
     return res.status(503).json({
       success: false,
-      error: "Password reset email service is not configured.",
+      error:
+        "Password reset email is temporarily unavailable. Please try again later.",
     });
   }
+
+  if (!/^\S+@\S+\.\S+$/.test(normalizedEmail)) return res.json(genericResponse);
 
   try {
     const user = await User.findOne({ email: normalizedEmail });
