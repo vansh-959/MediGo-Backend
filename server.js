@@ -24,11 +24,9 @@ const JWT_SECRET = process.env.JWT_SECRET || "local-development-only-secret";
 const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
 const GEMINI_MODELS = [
   process.env.GEMINI_MODEL,
-  "gemini-3.6-flash",
-  "gemini-3.8-flash",
-  "gemini-3.7-flash",
-  "gemini-3.5-flash-lite",
-  "gemini-flash-latest",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-2.0-flash",
 ].filter(
   (model, index, models) => Boolean(model) && models.indexOf(model) === index,
 );
