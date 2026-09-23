@@ -6,7 +6,8 @@
     "main": "server.js",
     "scripts": {
         "start": "node server.js",
-        "check": "node --check server.js"
+        "check": "node --check server.js",
+        "seed:procedure-costs": "node scripts/seed-procedure-costs.js"
     },
     "engines": {
         "node": ">=20"
