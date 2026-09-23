@@ -23,10 +23,10 @@ if (process.env.NODE_ENV === "production" && !process.env.JWT_SECRET) {
 const JWT_SECRET = process.env.JWT_SECRET || "local-development-only-secret";
 const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY;
 const GEMINI_MODELS = [
-  process.env.GEMINI_MODEL,
   "gemini-2.5-flash",
   "gemini-2.5-flash-lite",
   "gemini-2.0-flash",
+  process.env.GEMINI_MODEL,
 ].filter(
   (model, index, models) => Boolean(model) && models.indexOf(model) === index,
 );
@@ -2550,7 +2550,7 @@ Suggest nearby hospitals only when the user asks for them or their health questi
         : "";
 
       const fullPrompt = `${systemInstructions}\n\n${historyContext}User query: "${cleanMessage}"\nAssistant:`;
-      const geminiRes = await callGemini(fullPrompt, {}, 2, 7000);
+      const geminiRes = await callGemini(fullPrompt, {}, 3, 20000);
       if (geminiRes && geminiRes.text) {
         reply = geminiRes.text;
         modelUsed = geminiRes.model;
