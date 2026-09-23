@@ -3,12 +3,13 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const envPaths = [
+  process.env.MEDIGO_ENV_PATH && path.resolve(process.env.MEDIGO_ENV_PATH),
   path.join(__dirname, "../.env"),
   path.join(__dirname, ".env"),
   path.join(__dirname, "models/.env"),
-];
+].filter(Boolean);
 const envPath = envPaths.find((candidate) => fs.existsSync(candidate));
-require("dotenv").config({ path: envPath });
+if (envPath) require("dotenv").config({ path: envPath });
 
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
