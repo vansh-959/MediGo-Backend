@@ -33,19 +33,18 @@ The frontend files are in `MediGo-Frontend/public`. When the two folders are sid
 
 Add these values to `.env` when you use the related feature:
 
-- `MONGODB_URI` — stores accounts, email verification codes, and reviewed cost data.
-- `JWT_SECRET` — protects signed-in sessions. Use a long, private value.
-- `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, and `SMTP_FROM` — sends email sign-in codes. `SMTP_URL` can be used instead.
-- `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_FROM_NUMBER` — optional SMS delivery for signup and login codes.
+- `MONGODB_URI` — stores hospital and reviewed cost data.
+- `JWT_SECRET` — protects administrative tools. Use a long, private value.
+- `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, and `SMTP_FROM` — sends emergency preparation emails. `SMTP_URL` can be used instead.
 - `GEMINI_API_KEY` — enables AI chat and report reading.
 - `GEOAPIFY_API_KEY` — optional, helps turn GPS coordinates into a readable address.
 - `CORS_ORIGINS` — allowed website addresses when frontend and backend are hosted separately.
 
 Keep `.env` private. Do not put these keys in frontend JavaScript.
 
-## Sign-in codes
+## Public access
 
-Login and signup use a one-time code. Codes are sent by email. To send them by SMS instead, set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_FROM_NUMBER`; include the country code in the phone number (for example, `+91`). The server saves a hashed code in MongoDB for up to five minutes, limits wrong attempts, and accepts only the latest code. MongoDB and at least one delivery method (SMTP or Twilio) must be available.
+Hospital search, nearby discovery, cost estimates, government scheme lookup, chat, report reading, comparison, and reviews are available without creating an account. AI tools need a valid `GEMINI_API_KEY`. Location-based results need GPS permission or a city name.
 
 ## Location and maps
 
@@ -60,7 +59,6 @@ To load the example records into a local database, run `npm run seed:procedure-c
 ## Main folders
 
 - `MediGo-Frontend/public/index.html` — home page and health tools.
-- `MediGo-Frontend/public/auth.html` — login and signup.
 - `MediGo-Frontend/public/emergency.html` — emergency contacts and nearby hospitals.
 - `MediGo-Frontend/public/results.html` — hospital search results and map.
 - `MediGo-Backend/server.js` — web server and API.
@@ -72,4 +70,4 @@ To load the example records into a local database, run `npm run seed:procedure-c
 - Hospital phone numbers, services, bed counts, and map listings can be incomplete or out of date. Call before travelling.
 - A hospital preparation email is only a message; it does not mean the hospital received it or is ready.
 - AI summaries can make mistakes. Ask a qualified health professional about your care.
-- Emergency calling works without signing in. Other account features need a MediGo account.
+- Emergency calling and the public health tools do not require an account.

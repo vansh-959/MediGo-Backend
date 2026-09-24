@@ -23,10 +23,6 @@ const userSchema = new mongoose.Schema(
       trim: true,
       maxlength: 30,
     },
-    passwordHash: {
-      type: String,
-      select: false,
-    },
     city: {
       type: String,
       trim: true,
@@ -36,27 +32,6 @@ const userSchema = new mongoose.Schema(
     location: {
       lat: Number,
       lng: Number,
-    },
-    resetPasswordTokenHash: {
-      type: String,
-      select: false,
-    },
-    resetPasswordExpiresAt: {
-      type: Date,
-      select: false,
-    },
-    passwordResetOtpHash: {
-      type: String,
-      select: false,
-    },
-    passwordResetOtpExpiresAt: {
-      type: Date,
-      select: false,
-    },
-    passwordResetOtpAttempts: {
-      type: Number,
-      select: false,
-      default: 0,
     },
   },
   { timestamps: true }

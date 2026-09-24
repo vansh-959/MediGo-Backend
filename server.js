@@ -1,7 +1,6 @@
 const express = require("express");
 const path = require("path");
 const fs = require("fs");
-const crypto = require("crypto");
 const envPaths = [
   path.join(__dirname, ".env"),
   path.join(__dirname, "../.env"),
@@ -11,11 +10,9 @@ const envPath = envPaths.find((candidate) => fs.existsSync(candidate));
 require("dotenv").config({ path: envPath });
 
 const mongoose = require("mongoose");
-const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
 const User = require("./models/User");
-const EmailOtp = require("./models/EmailOtp");
 const { createReportReaderRouter } = require("./routes/report-reader");
 const { createCostEstimateRouter } = require("./routes/cost-estimate");
 const { schemesForCity, stateForCity } = require("./data/government-schemes");
@@ -65,10 +62,6 @@ const mailTransport = process.env.SMTP_URL
     : null;
 
 const mailFrom = process.env.SMTP_FROM || process.env.SMTP_USER;
-const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID || "";
-const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN || "";
-const twilioFromNumber = process.env.TWILIO_FROM_NUMBER || "";
-const smsOtpConfigured = Boolean(twilioAccountSid && twilioAuthToken && twilioFromNumber);
 let smtpStatus = mailTransport && mailFrom ? "checking" : "not_configured";
 
 if (mailTransport && mailFrom) {
@@ -83,7 +76,7 @@ if (mailTransport && mailFrom) {
       console.error(`SMTP connection failed: ${error.code || error.name}`);
     });
 } else {
-  console.warn("SMTP not configured: email OTP delivery is disabled.");
+  console.warn("SMTP not configured: emergency alert email delivery is disabled.");
 }
 
 const connectDB = async () => {
@@ -192,39 +185,6 @@ const USERS_STORE = [
     createdAt: new Date(Date.now() - 86400000 * 1),
   },
 ];
-const PASSWORD_RESET_REQUESTS = new Map();
-const OTP_TTL_MS = 5 * 60 * 1000;
-const hashOtp = (otp) => crypto.createHash("sha256").update(String(otp)).digest("hex");
-async function sendOtpCode(to, otp, purpose, phone = "") {
-  const labels = {
-    signup: "account verification",
-    login: "sign-in",
-    reset: "password reset",
-  };
-  const label = labels[purpose] || "verification";
-  if (purpose !== "reset" && smsOtpConfigured && /^\+[1-9]\d{7,14}$/.test(String(phone).replace(/[\s()-]/g, ""))) {
-    const target = String(phone).replace(/[\s()-]/g, "");
-    const body = new URLSearchParams({ To: target, From: twilioFromNumber, Body: `Your MediGo ${label} code is ${otp}. It expires in 5 minutes. Do not share this code.` });
-    const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${twilioAccountSid}/Messages.json`, {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString("base64")}`,
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body,
-      signal: AbortSignal.timeout(12000),
-    });
-    if (response.ok) return "phone";
-    if (!mailTransport || !mailFrom) throw new Error("SMS provider could not send the verification code.");
-  }
-  if (!mailTransport || !mailFrom) throw new Error("Email code delivery is not configured.");
-  await mailTransport.sendMail({
-    from: mailFrom, to, subject: `MediGo ${label} code`,
-    text: `Your MediGo ${label} code is ${otp}. It expires in 5 minutes. If you did not request this, ignore this email.`,
-    html: `<p>Your MediGo ${label} code is:</p><p style="font-size:28px;font-weight:700;letter-spacing:6px">${otp}</p><p>This code expires in 5 minutes.</p>`,
-  });
-  return "email";
-}
 async function resolveCityFromCoords(lat, lng) {
   if (GEOAPIFY_API_KEY) {
     try {
@@ -368,22 +328,6 @@ const EMERGENCY_ALERTS = [
   },
 ];
 
-const publicUser = (user) => ({
-  id: user._id || user.id,
-  name: user.name,
-  email: user.email,
-  phone: user.phone,
-  city: user.city || "",
-  location: user.location || null,
-});
-
-const createToken = (user) =>
-  jwt.sign(
-    { sub: (user._id || user.id).toString(), email: user.email },
-    JWT_SECRET,
-    { expiresIn: "7d" },
-  );
-
 const authenticate = async (req, res, next) => {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
@@ -410,7 +354,7 @@ const authenticate = async (req, res, next) => {
   } catch (error) {
     return res.status(401).json({
       success: false,
-      error: "Session expired. Please sign in again.",
+      error: "This administrative session has expired. Refresh your admin access.",
     });
   }
 };
@@ -429,516 +373,6 @@ const requireSiteOwner = (req, res, next) => {
   next();
 };
 
-app.post("/api/auth/signup", async (req, res) => {
-  return res.status(410).json({
-    success: false,
-    error: "Direct signup is disabled. Request and verify a one-time code to create an account.",
-  });
-
-  if (mongoose.connection.readyState !== 1) {
-    return res.status(503).json({
-      success: false,
-      error:
-        "Account service is waiting for its database connection. Please try again shortly.",
-    });
-  }
-  const { name, email, phone, city = "" } = req.body || {};
-  const normalizedEmail =
-    typeof email === "string" ? email.trim().toLowerCase() : "";
-  if (
-    normalizedEmail &&
-    normalizedEmail ===
-      (process.env.SITE_OWNER_EMAIL || "").trim().toLowerCase()
-  ) {
-    return res.status(403).json({
-      success: false,
-      error: "This email cannot be registered through public signup.",
-    });
-  }
-
-  if (
-    typeof name !== "string" ||
-    name.trim().length < 2 ||
-    name.trim().length > 80 ||
-    typeof phone !== "string" ||
-    phone.trim().replace(/\D/g, "").length < 7 ||
-    phone.trim().length > 30 ||
-    !/^\S+@\S+\.\S+$/.test(normalizedEmail)
-  ) {
-    return res.status(400).json({
-      success: false,
-      error: "Full name, phone, and a valid email are required.",
-    });
-  }
-  try {
-    if (mongoose.connection.readyState === 1) {
-      const existingUser = await User.findOne({ email: normalizedEmail });
-      if (existingUser)
-        return res.status(409).json({
-          success: false,
-          error: "An account with this email already exists.",
-        });
-
-      const user = await User.create({
-        name: name.trim(),
-        email: normalizedEmail,
-        phone: phone.trim(),
-        city: typeof city === "string" ? city.trim() : "",
-      });
-      const pUser = publicUser(user);
-      USERS_STORE.unshift({ ...pUser, createdAt: new Date() });
-      return res
-        .status(201)
-        .json({ success: true, user: pUser, token: createToken(user) });
-    }
-  } catch (error) {
-    if (error.code === 11000)
-      return res.status(409).json({
-        success: false,
-        error: "An account with this email already exists.",
-      });
-    console.error("Signup error:", error.message);
-    return res
-      .status(500)
-      .json({ success: false, error: "Unable to create account right now." });
-  }
-});
-
-app.post("/api/auth/login", async (req, res) => {
-  return res.status(410).json({
-    success: false,
-    error: "Password sign-in is disabled. Request and verify a one-time code instead.",
-  });
-
-  if (mongoose.connection.readyState !== 1) {
-    return res.status(503).json({
-      success: false,
-      error:
-        "Account service is waiting for its database connection. Please try again shortly.",
-    });
-  }
-  const { email, password } = req.body || {};
-  const normalizedEmail =
-    typeof email === "string" ? email.trim().toLowerCase() : "";
-  if (!normalizedEmail || typeof password !== "string") {
-    return res
-      .status(400)
-      .json({ success: false, error: "Email and password are required." });
-  }
-
-  try {
-    if (mongoose.connection.readyState === 1) {
-      const user = await User.findOne({ email: normalizedEmail }).select(
-        "+passwordHash",
-      );
-      if (!user?.passwordHash || !(await bcrypt.compare(password, user.passwordHash))) {
-        return res
-          .status(401)
-          .json({ success: false, error: "Invalid email or password." });
-      }
-      return res.json({
-        success: true,
-        user: publicUser(user),
-        token: createToken(user),
-      });
-    }
-  } catch (error) {
-    console.error("Login error:", error.message);
-    return res
-      .status(500)
-      .json({ success: false, error: "Unable to sign in right now." });
-  }
-});
-
-app.post("/api/auth/send-otp", async (req, res) => {
-  if (mongoose.connection.readyState !== 1) {
-    return res.status(503).json({
-      success: false,
-      error: "Account service is waiting for its database connection. Please try again shortly.",
-    });
-  }
-  if ((!mailTransport || !mailFrom) && !smsOtpConfigured) {
-    return res.status(503).json({
-      success: false,
-      error: "OTP delivery is not configured. Ask the site administrator to set up email or SMS delivery.",
-    });
-  }
-  const purpose = String(req.body?.purpose || "").trim().toLowerCase();
-  if (!["signup", "login"].includes(purpose)) {
-    return res.status(400).json({ success: false, error: "Choose signup or login." });
-  }
-  const normalizedEmail =
-    typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
-  if (!/^\S+@\S+\.\S+$/.test(normalizedEmail)) {
-    return res.status(400).json({ success: false, error: "A valid email is required." });
-  }
-  const existing = purpose === "reset" ? null : await EmailOtp.findOne({ email: normalizedEmail, purpose }).lean();
-  if (existing && Date.now() - new Date(existing.sentAt).getTime() < 60_000) {
-    return res.status(429).json({
-      success: false,
-      error: "Wait 60 seconds before requesting another email code.",
-    });
-  }
-
-  try {
-    const user = await User.findOne({ email: normalizedEmail }).select("+passwordHash");
-    let pendingSignup = null;
-    if (purpose === "signup") {
-      if (user) {
-        return res.status(409).json({
-          success: false,
-          error: "An account with this email already exists. Sign in instead.",
-        });
-      }
-      if (
-        normalizedEmail === (process.env.SITE_OWNER_EMAIL || "").trim().toLowerCase()
-      ) {
-        return res.status(403).json({
-          success: false,
-          error: "This email cannot be registered through public signup.",
-        });
-      }
-      const { name, phone, city = "" } = req.body || {};
-      if (
-        typeof name !== "string" ||
-        name.trim().length < 2 ||
-        name.trim().length > 80 ||
-        typeof phone !== "string" ||
-        phone.trim().replace(/\D/g, "").length < 7 ||
-        phone.trim().length > 30
-      ) {
-        return res.status(400).json({
-          success: false,
-          error: "Full name, phone, and a valid email are required.",
-        });
-      }
-      pendingSignup = {
-        name: name.trim(),
-        phone: phone.trim(),
-        city: typeof city === "string" ? city.trim().slice(0, 100) : "",
-      };
-    } else if (!user) {
-      if (purpose === "reset") {
-        return res.json({
-          success: true,
-          message: "If an account exists, a code was sent to your email.",
-        });
-      }
-      return res.status(404).json({
-        success: false,
-        error: "No account found for this email. Create an account first.",
-      });
-    }
-
-    const otp = String(crypto.randomInt(100000, 1000000));
-    if (purpose !== "reset") {
-      await EmailOtp.findOneAndUpdate(
-        { email: normalizedEmail, purpose },
-        { $set: {
-          otpHash: hashOtp(otp),
-          expiresAt: new Date(Date.now() + OTP_TTL_MS),
-          sentAt: new Date(),
-          attempts: 0,
-          pendingSignup,
-        } },
-        { upsert: true, new: true, setDefaultsOnInsert: true },
-      );
-    }
-    if (purpose === "reset" && user) {
-      user.passwordResetOtpHash = hashOtp(otp);
-      user.passwordResetOtpExpiresAt = new Date(Date.now() + OTP_TTL_MS);
-      user.passwordResetOtpAttempts = 0;
-      await user.save();
-    }
-    const deliveryPhone = purpose === "signup" ? req.body?.phone : user?.phone;
-    const deliveryChannel = await sendOtpCode(normalizedEmail, otp, purpose, deliveryPhone);
-    return res.json({
-      success: true,
-      deliveryChannel,
-      message: `A 6-digit code was sent to your ${deliveryChannel}. It is valid for 5 minutes.`,
-    });
-  } catch (error) {
-    if (purpose !== "reset") await EmailOtp.deleteOne({ email: normalizedEmail, purpose }).catch(() => {});
-    console.error("Send OTP error:", error.message);
-    return res.status(503).json({
-      success: false,
-      error: "Could not send the email code. Check the address and try again.",
-    });
-  }
-});
-
-app.post("/api/auth/verify-otp", async (req, res) => {
-  if (mongoose.connection.readyState !== 1) {
-    return res.status(503).json({
-      success: false,
-      error: "Account service is waiting for its database connection. Please try again shortly.",
-    });
-  }
-  const purpose = String(req.body?.purpose || "").trim().toLowerCase();
-  const otp = String(req.body?.otp || "");
-  const normalizedEmail =
-    typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
-  if (!["signup", "login"].includes(purpose) || !/^\S+@\S+\.\S+$/.test(normalizedEmail) || !/^\d{6}$/.test(otp)) {
-    return res.status(400).json({
-      success: false,
-      error: "Email, 6-digit code, and a valid purpose are required.",
-    });
-  }
-  const stored = await EmailOtp.findOne({ email: normalizedEmail, purpose });
-  if (!stored || stored.expiresAt <= new Date()) {
-    if (stored) await stored.deleteOne();
-    return res.status(400).json({
-      success: false,
-      error: "Code is invalid or expired. Request a new code.",
-    });
-  }
-  if (stored.attempts >= 5) {
-    await stored.deleteOne();
-    return res.status(429).json({
-      success: false,
-      error: "Too many incorrect attempts. Request a new code.",
-    });
-  }
-  const saved = Buffer.from(stored.otpHash, "hex");
-  const provided = Buffer.from(hashOtp(otp), "hex");
-  if (saved.length !== provided.length || !crypto.timingSafeEqual(saved, provided)) {
-    stored.attempts += 1;
-    await stored.save();
-    return res.status(400).json({
-      success: false,
-      error: "Incorrect code. Enter the latest email or text message code, or request a new one.",
-    });
-  }
-
-  try {
-    if (purpose === "signup") {
-      const pending = stored.pendingSignup;
-      if (!pending) {
-        await stored.deleteOne();
-        return res.status(400).json({ success: false, error: "Signup details expired. Start again." });
-      }
-      const user = await User.create({
-        name: pending.name,
-        email: normalizedEmail,
-        phone: pending.phone,
-        city: pending.city || "",
-      });
-      await stored.deleteOne();
-      const pUser = publicUser(user);
-      USERS_STORE.unshift({ ...pUser, createdAt: new Date() });
-      return res.status(201).json({ success: true, user: pUser, token: createToken(user) });
-    }
-
-    const user = await User.findOne({ email: normalizedEmail });
-    await stored.deleteOne();
-    if (!user) {
-      return res.status(404).json({ success: false, error: "No account found for this email." });
-    }
-    return res.json({ success: true, user: publicUser(user), token: createToken(user) });
-  } catch (error) {
-    if (error.code === 11000) {
-      return res.status(409).json({
-        success: false,
-        error: "An account with this email already exists.",
-      });
-    }
-    console.error("Verify OTP error:", error.message);
-    return res.status(500).json({ success: false, error: "Unable to verify the code right now." });
-  }
-});
-
-app.post("/api/auth/forgot-password", async (req, res) => {
-  return res.status(410).json({ success: false, error: "MediGo uses one-time sign-in codes and does not use account passwords." });
-
-  if (mongoose.connection.readyState !== 1) {
-    return res.status(503).json({
-      success: false,
-      error:
-        "Account service is waiting for its database connection. Please try again shortly.",
-    });
-  }
-  const normalizedEmail =
-    typeof req.body?.email === "string"
-      ? req.body.email.trim().toLowerCase()
-      : "";
-  const genericResponse = {
-    success: true,
-    message: "If an account exists, a password-reset OTP has been sent.",
-  };
-  if (!/^\S+@\S+\.\S+$/.test(normalizedEmail)) return res.json(genericResponse);
-
-  if (!mailTransport || !mailFrom) {
-    return res.status(503).json({
-      success: false,
-      error: "Password reset email service is not configured.",
-    });
-  }
-
-  const now = Date.now();
-  const lastOtpRequest = PASSWORD_RESET_REQUESTS.get(normalizedEmail) || 0;
-  if (now - lastOtpRequest < 60_000) {
-    return res.status(429).json({ success: false, error: "Wait 60 seconds before requesting another password-reset code." });
-  }
-  PASSWORD_RESET_REQUESTS.set(normalizedEmail, now);
-  if (PASSWORD_RESET_REQUESTS.size > 1000) {
-    for (const [address, requestedAt] of PASSWORD_RESET_REQUESTS) {
-      if (now - requestedAt >= 60_000) PASSWORD_RESET_REQUESTS.delete(address);
-    }
-  }
-
-  try {
-    const user = await User.findOne({ email: normalizedEmail });
-    if (user) {
-      const otp = String(crypto.randomInt(100000, 1000000));
-      user.passwordResetOtpHash = crypto
-        .createHash("sha256")
-        .update(otp)
-        .digest("hex");
-      user.passwordResetOtpExpiresAt = new Date(Date.now() + OTP_TTL_MS);
-      user.passwordResetOtpAttempts = 0;
-      await user.save();
-      await mailTransport.sendMail({
-        from: mailFrom,
-        to: normalizedEmail,
-        subject: "MedAdvisor password reset OTP",
-        text: `Your MediGo password reset code is ${otp}. It expires in 60 seconds. If you did not request this, ignore this email.`,
-        html: `<p>Your MediGo password reset code is:</p><p style="font-size:28px;font-weight:700;letter-spacing:6px">${otp}</p><p>This code expires in 60 seconds.</p>`,
-      });
-    }
-    return res.json(genericResponse);
-  } catch (error) {
-    console.error("Forgot password error:", error.message);
-    return res.status(503).json({
-      success: false,
-      error: "Could not send the reset email. Check the email address and try again.",
-    });
-  }
-});
-
-app.post("/api/auth/reset-password", async (req, res) => {
-  return res.status(410).json({ success: false, error: "MediGo uses one-time sign-in codes and does not use account passwords." });
-
-  if (mongoose.connection.readyState !== 1) {
-    return res.status(503).json({
-      success: false,
-      error:
-        "Account service is waiting for its database connection. Please try again shortly.",
-    });
-  }
-  const { email, otp, password } = req.body || {};
-  if (
-    typeof email !== "string" ||
-    !/^\S+@\S+\.\S+$/.test(email.trim()) ||
-    !/^\d{6}$/.test(String(otp || "")) ||
-    typeof password !== "string" ||
-    password.length < 8 ||
-    Buffer.byteLength(password, "utf8") > 72
-  ) {
-    return res.status(400).json({
-      success: false,
-      error:
-        "Email, six-digit OTP, and a password of at least 8 characters are required.",
-    });
-  }
-
-  try {
-    const otpHash = crypto
-      .createHash("sha256")
-      .update(String(otp))
-      .digest("hex");
-    const user = await User.findOne({
-      email: email.trim().toLowerCase(),
-    }).select(
-      "+passwordResetOtpHash +passwordResetOtpExpiresAt +passwordResetOtpAttempts",
-    );
-    if (
-      !user ||
-      !user.passwordResetOtpHash ||
-      !user.passwordResetOtpExpiresAt ||
-      user.passwordResetOtpExpiresAt <= new Date()
-    ) {
-      return res.status(400).json({
-        success: false,
-        error: "OTP is invalid or expired. Request a new code.",
-      });
-    }
-    if (user.passwordResetOtpAttempts >= 5) {
-      return res.status(429).json({
-        success: false,
-        error: "Too many incorrect OTP attempts. Request a new code.",
-      });
-    }
-    const savedOtpHash = Buffer.from(user.passwordResetOtpHash, "hex");
-    const providedOtpHash = Buffer.from(otpHash, "hex");
-    if (savedOtpHash.length !== providedOtpHash.length || !crypto.timingSafeEqual(savedOtpHash, providedOtpHash)) {
-      user.passwordResetOtpAttempts += 1;
-      await user.save();
-      return res.status(400).json({ success: false, error: "Incorrect OTP." });
-    }
-
-    user.passwordHash = await bcrypt.hash(password, 12);
-    user.passwordResetOtpHash = undefined;
-    user.passwordResetOtpExpiresAt = undefined;
-    user.passwordResetOtpAttempts = 0;
-    await user.save();
-    return res.json({
-      success: true,
-      message: "Password updated. You can now sign in.",
-    });
-  } catch (error) {
-    console.error("Reset password error:", error.message);
-    return res
-      .status(500)
-      .json({ success: false, error: "Unable to reset password right now." });
-  }
-});
-
-app.get("/api/auth/me", authenticate, (req, res) => {
-  res.json({ success: true, user: publicUser(req.user) });
-});
-
-app.patch("/api/auth/profile", authenticate, async (req, res) => {
-  const { name, phone, city, location } = req.body || {};
-  if (name === undefined && phone === undefined && city === undefined && location === undefined) {
-    return res.status(400).json({ success: false, error: "Provide at least one profile field to update." });
-  }
-  if (
-    name !== undefined &&
-    (typeof name !== "string" || name.trim().length < 2 || name.trim().length > 80)
-  ) {
-    return res.status(400).json({
-      success: false,
-      error: "Full name must be at least 2 characters.",
-    });
-  }
-  if (phone !== undefined && (typeof phone !== "string" || phone.trim().replace(/\D/g, "").length < 7 || phone.trim().length > 30)) {
-    return res
-      .status(400)
-      .json({ success: false, error: "Phone number is required." });
-  }
-  if (city !== undefined && (typeof city !== "string" || city.trim().length > 100)) {
-    return res.status(400).json({ success: false, error: "City must be 100 characters or fewer." });
-  }
-  if (
-    location !== undefined &&
-    (location === null || typeof location !== "object" ||
-      !Number.isFinite(location.lat) || !Number.isFinite(location.lng) ||
-      Math.abs(location.lat) > 90 || Math.abs(location.lng) > 180)
-  ) {
-    return res
-      .status(400)
-      .json({ success: false, error: "Location coordinates are invalid." });
-  }
-
-  if (name !== undefined) req.user.name = name.trim();
-  if (phone !== undefined) req.user.phone = phone.trim();
-  if (city !== undefined)
-    req.user.city = typeof city === "string" ? city.trim() : "";
-  if (location !== undefined) req.user.location = location;
-  if (req.user.save) await req.user.save();
-  return res.json({ success: true, user: publicUser(req.user) });
-});
-
 app.get("/api/health", (req, res) => {
   const databaseConnected = mongoose.connection.readyState === 1;
   res.status(200).json({
@@ -950,7 +384,6 @@ app.get("/api/health", (req, res) => {
         ? "disconnected"
         : "in-memory-fallback",
     smtp: smtpStatus,
-    otpDelivery: smsOtpConfigured ? "sms" : mailTransport && mailFrom ? "email" : "not_configured",
     uptimeSeconds: Math.round(process.uptime()),
     geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
     geminiStatus,
@@ -2032,7 +1465,6 @@ async function callGemini(
 
 app.use(
   "/api/reports",
-  authenticate,
   createReportReaderRouter({
     fallbackHospitals: HOSPITALS,
     analyzeImage: async (imageBuffer, mimeType, language = "en") => {
@@ -2667,7 +2099,7 @@ Citizen Query: "${query}"`;
 // =========================================================================
 
 // Search Hospitals Endpoint (Natural Language Disease + Location + Budget)
-app.post("/api/hospitals/search", authenticate, async (req, res) => {
+app.post("/api/hospitals/search", async (req, res) => {
   const query =
     typeof req.body?.query === "string" ? req.body.query.trim() : "";
   const cityOverride =
@@ -2692,6 +2124,13 @@ app.post("/api/hospitals/search", authenticate, async (req, res) => {
       Number.isFinite(userLng) &&
       Math.abs(userLat) <= 90 &&
       Math.abs(userLng) <= 180;
+
+    if (!cityOverride && !intent.location && !hasCoordinates) {
+      return res.status(400).json({
+        success: false,
+        error: "Allow location access or enter your city to find nearby hospitals.",
+      });
+    }
 
     let searchLat = hasCoordinates ? userLat : 30.7333; // Default to Chandigarh center
     let searchLng = hasCoordinates ? userLng : 76.7794;
@@ -2833,8 +2272,8 @@ app.post("/api/hospitals/search", authenticate, async (req, res) => {
     if (specialtyMatches.length) matchedHospitals = specialtyMatches;
 
     // If budget specified, filter or prioritize
-    if (intent.budgetMax) {
-      matchedHospitals.sort((a, b) => b.rankScore - a.rankScore);
+    if (hasCoordinates || targetLocationName) {
+      matchedHospitals.sort((a, b) => a.distanceKm - b.distanceKm);
     } else {
       matchedHospitals.sort((a, b) => b.rankScore - a.rankScore);
     }
@@ -3090,7 +2529,7 @@ app.get("/api/location/geocode", (req, res) => {
   return res.json({ success: true, city: place.name || key, lat: place.lat, lng: place.lng, approximate: true });
 });
 
-app.get("/api/schemes", authenticate, async (req, res) => {
+app.get("/api/schemes", async (req, res) => {
   const lat = Number(req.query.lat);
   const lng = Number(req.query.lng);
   let city = String(req.query.city || "").trim().slice(0, 100);
@@ -3132,14 +2571,14 @@ app.get("/api/schemes", authenticate, async (req, res) => {
   });
 });
 
-app.use("/api/cost-estimate", createCostEstimateRouter({ hospitals: HOSPITALS, authenticate }));
+app.use("/api/cost-estimate", createCostEstimateRouter({ hospitals: HOSPITALS }));
 
 // =========================================================================
 // GEMINI MULTILINGUAL CHAT ASSISTANT
 // Multi-turn context, empathetic medical triage, dynamic hospital integration
 // =========================================================================
 
-app.post("/api/chat", authenticate, async (req, res) => {
+app.post("/api/chat", async (req, res) => {
   const { location, city, history, language: requestedLanguage } = req.body || {};
   const messageInput =
     typeof req.body?.message === "string" && req.body.message.trim()
@@ -3730,7 +3169,7 @@ app.get("/api/reviews", (req, res) => {
   return res.json({ success: true, count: list.length, reviews: list });
 });
 
-app.post("/api/reviews", authenticate, (req, res) => {
+app.post("/api/reviews", (req, res) => {
   const {
     hospitalId,
     hospitalName,
@@ -3757,8 +3196,10 @@ app.post("/api/reviews", authenticate, (req, res) => {
     id: "rev-" + Date.now(),
     hospitalId,
     hospitalName: targetHospital.name,
-    userName: req.user.name || "MediGo user",
-    userEmail: req.user.email || "",
+    userName: typeof userName === "string" && userName.trim()
+      ? userName.trim().slice(0, 80)
+      : "MediGo visitor",
+    userEmail: "",
     rating: parsedRating,
     treatment: (treatment && treatment.trim()) || "General Clinical Care",
     comment: comment.trim(),

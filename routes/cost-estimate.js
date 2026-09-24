@@ -87,7 +87,7 @@ async function resolveCost(procedure, scheme, city) {
   return selectDemoCost(procedure, scheme);
 }
 
-function createCostEstimateRouter({ hospitals, authenticate }) {
+function createCostEstimateRouter({ hospitals }) {
   const router = express.Router();
 
   router.get("/options", async (req, res) => {
@@ -117,7 +117,7 @@ function createCostEstimateRouter({ hospitals, authenticate }) {
     });
   });
 
-  router.post("/", authenticate, async (req, res) => {
+  router.post("/", async (req, res) => {
     const { procedureKey, city, isBeneficiary, scheme } = req.body || {};
     const lat = Number(req.body?.lat);
     const lng = Number(req.body?.lng);
