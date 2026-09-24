@@ -15,8 +15,10 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
 const User = require("./models/User");
+const EmailOtp = require("./models/EmailOtp");
 const { createReportReaderRouter } = require("./routes/report-reader");
 const { createCostEstimateRouter } = require("./routes/cost-estimate");
+const { schemesForCity, stateForCity } = require("./data/government-schemes");
 
 if (process.env.NODE_ENV === "production" && !process.env.JWT_SECRET) {
   throw new Error("JWT_SECRET must be configured in production.");
@@ -63,6 +65,10 @@ const mailTransport = process.env.SMTP_URL
     : null;
 
 const mailFrom = process.env.SMTP_FROM || process.env.SMTP_USER;
+const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID || "";
+const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN || "";
+const twilioFromNumber = process.env.TWILIO_FROM_NUMBER || "";
+const smsOtpConfigured = Boolean(twilioAccountSid && twilioAuthToken && twilioFromNumber);
 let smtpStatus = mailTransport && mailFrom ? "checking" : "not_configured";
 
 if (mailTransport && mailFrom) {
@@ -127,7 +133,6 @@ app.use((req, res, next) => {
     `http://localhost:${PORT}`,
     `http://127.0.0.1:${PORT}`,
     "https://medi-go-frontend.vercel.app",
-    "https://medi-go-frontend-gr0t3x06-vansh-959s-projects.vercel.app",
   ]);
 
   const isLocalPreview = origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
@@ -188,6 +193,86 @@ const USERS_STORE = [
   },
 ];
 const PASSWORD_RESET_REQUESTS = new Map();
+const OTP_TTL_MS = 5 * 60 * 1000;
+const hashOtp = (otp) => crypto.createHash("sha256").update(String(otp)).digest("hex");
+async function sendOtpCode(to, otp, purpose, phone = "") {
+  const labels = {
+    signup: "account verification",
+    login: "sign-in",
+    reset: "password reset",
+  };
+  const label = labels[purpose] || "verification";
+  if (purpose !== "reset" && smsOtpConfigured && /^\+[1-9]\d{7,14}$/.test(String(phone).replace(/[\s()-]/g, ""))) {
+    const target = String(phone).replace(/[\s()-]/g, "");
+    const body = new URLSearchParams({ To: target, From: twilioFromNumber, Body: `Your MediGo ${label} code is ${otp}. It expires in 5 minutes. Do not share this code.` });
+    const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${twilioAccountSid}/Messages.json`, {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString("base64")}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+      signal: AbortSignal.timeout(12000),
+    });
+    if (response.ok) return "phone";
+    if (!mailTransport || !mailFrom) throw new Error("SMS provider could not send the verification code.");
+  }
+  if (!mailTransport || !mailFrom) throw new Error("Email code delivery is not configured.");
+  await mailTransport.sendMail({
+    from: mailFrom, to, subject: `MediGo ${label} code`,
+    text: `Your MediGo ${label} code is ${otp}. It expires in 5 minutes. If you did not request this, ignore this email.`,
+    html: `<p>Your MediGo ${label} code is:</p><p style="font-size:28px;font-weight:700;letter-spacing:6px">${otp}</p><p>This code expires in 5 minutes.</p>`,
+  });
+  return "email";
+}
+async function resolveCityFromCoords(lat, lng) {
+  if (GEOAPIFY_API_KEY) {
+    try {
+      const reverseUrl = new URL("https://api.geoapify.com/v1/geocode/reverse");
+      reverseUrl.searchParams.set("lat", String(lat));
+      reverseUrl.searchParams.set("lon", String(lng));
+      reverseUrl.searchParams.set("format", "json");
+      reverseUrl.searchParams.set("apiKey", GEOAPIFY_API_KEY);
+      const response = await fetch(reverseUrl, { signal: AbortSignal.timeout(4500) });
+      if (response.ok) {
+        const data = await response.json();
+        const result = data.results?.[0] || {};
+        const city = result.city || result.town || result.county || result.state || "";
+        return {
+          city: String(city).slice(0, 100),
+          state: String(result.state || "").slice(0, 100),
+          address: String(result.formatted || "").slice(0, 240),
+        };
+      }
+    } catch (error) {
+      console.warn("Reverse geocoding unavailable:", error.message);
+    }
+  }
+  let nearest = null;
+  let best = Infinity;
+  for (const hospital of HOSPITALS) {
+    const hLat = Number(hospital.coordinates?.lat);
+    const hLng = Number(hospital.coordinates?.lng);
+    if (!Number.isFinite(hLat) || !Number.isFinite(hLng)) continue;
+    const rad = (n) => (n * Math.PI) / 180;
+    const dLat = rad(hLat - lat);
+    const dLng = rad(hLng - lng);
+    const a =
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(rad(lat)) * Math.cos(rad(hLat)) * Math.sin(dLng / 2) ** 2;
+    const km = 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    if (km < best) {
+      best = km;
+      nearest = hospital;
+    }
+  }
+  return {
+    city: nearest?.city || "",
+    state: stateForCity(nearest?.city || ""),
+    address: nearest?.location || "",
+    nearestHospitalKm: Number.isFinite(best) ? Math.round(best * 10) / 10 : null,
+  };
+}
 
 const REVIEWS = [
   {
@@ -352,7 +437,7 @@ app.post("/api/auth/signup", async (req, res) => {
         "Account service is waiting for its database connection. Please try again shortly.",
     });
   }
-  const { name, email, phone, password, city = "" } = req.body || {};
+  const { name, email, phone, city = "" } = req.body || {};
   const normalizedEmail =
     typeof email === "string" ? email.trim().toLowerCase() : "";
   if (
@@ -380,13 +465,6 @@ app.post("/api/auth/signup", async (req, res) => {
       error: "Full name, phone, and a valid email are required.",
     });
   }
-  if (typeof password !== "string" || password.length < 8 || Buffer.byteLength(password, "utf8") > 72) {
-    return res.status(400).json({
-      success: false,
-      error: "Password must be 8 to 72 bytes long.",
-    });
-  }
-
   try {
     if (mongoose.connection.readyState === 1) {
       const existingUser = await User.findOne({ email: normalizedEmail });
@@ -401,7 +479,6 @@ app.post("/api/auth/signup", async (req, res) => {
         email: normalizedEmail,
         phone: phone.trim(),
         city: typeof city === "string" ? city.trim() : "",
-        passwordHash: await bcrypt.hash(password, 12),
       });
       const pUser = publicUser(user);
       USERS_STORE.unshift({ ...pUser, createdAt: new Date() });
@@ -444,7 +521,7 @@ app.post("/api/auth/login", async (req, res) => {
       const user = await User.findOne({ email: normalizedEmail }).select(
         "+passwordHash",
       );
-      if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+      if (!user?.passwordHash || !(await bcrypt.compare(password, user.passwordHash))) {
         return res
           .status(401)
           .json({ success: false, error: "Invalid email or password." });
@@ -460,6 +537,203 @@ app.post("/api/auth/login", async (req, res) => {
     return res
       .status(500)
       .json({ success: false, error: "Unable to sign in right now." });
+  }
+});
+
+app.post("/api/auth/send-otp", async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    return res.status(503).json({
+      success: false,
+      error: "Account service is waiting for its database connection. Please try again shortly.",
+    });
+  }
+  if ((!mailTransport || !mailFrom) && !smsOtpConfigured) {
+    return res.status(503).json({
+      success: false,
+      error: "OTP delivery is not configured. Ask the site administrator to set up email or SMS delivery.",
+    });
+  }
+  const purpose = String(req.body?.purpose || "").trim().toLowerCase();
+  if (!["signup", "login", "reset"].includes(purpose)) {
+    return res.status(400).json({ success: false, error: "Choose signup, login, or reset." });
+  }
+  const normalizedEmail =
+    typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+  if (!/^\S+@\S+\.\S+$/.test(normalizedEmail)) {
+    return res.status(400).json({ success: false, error: "A valid email is required." });
+  }
+  const existing = purpose === "reset" ? null : await EmailOtp.findOne({ email: normalizedEmail, purpose }).lean();
+  if (existing && Date.now() - new Date(existing.sentAt).getTime() < 60_000) {
+    return res.status(429).json({
+      success: false,
+      error: "Wait 60 seconds before requesting another email code.",
+    });
+  }
+
+  try {
+    const user = await User.findOne({ email: normalizedEmail }).select("+passwordHash");
+    let pendingSignup = null;
+    if (purpose === "signup") {
+      if (user) {
+        return res.status(409).json({
+          success: false,
+          error: "An account with this email already exists. Sign in instead.",
+        });
+      }
+      if (
+        normalizedEmail === (process.env.SITE_OWNER_EMAIL || "").trim().toLowerCase()
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: "This email cannot be registered through public signup.",
+        });
+      }
+      const { name, phone, city = "" } = req.body || {};
+      if (
+        typeof name !== "string" ||
+        name.trim().length < 2 ||
+        name.trim().length > 80 ||
+        typeof phone !== "string" ||
+        phone.trim().replace(/\D/g, "").length < 7 ||
+        phone.trim().length > 30
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Full name, phone, and a valid email are required.",
+        });
+      }
+      pendingSignup = {
+        name: name.trim(),
+        phone: phone.trim(),
+        city: typeof city === "string" ? city.trim().slice(0, 100) : "",
+      };
+    } else if (!user) {
+      if (purpose === "reset") {
+        return res.json({
+          success: true,
+          message: "If an account exists, a code was sent to your email.",
+        });
+      }
+      return res.status(404).json({
+        success: false,
+        error: "No account found for this email. Create an account first.",
+      });
+    }
+
+    const otp = String(crypto.randomInt(100000, 1000000));
+    if (purpose !== "reset") {
+      await EmailOtp.findOneAndUpdate(
+        { email: normalizedEmail, purpose },
+        { $set: {
+          otpHash: hashOtp(otp),
+          expiresAt: new Date(Date.now() + OTP_TTL_MS),
+          sentAt: new Date(),
+          attempts: 0,
+          pendingSignup,
+        } },
+        { upsert: true, new: true, setDefaultsOnInsert: true },
+      );
+    }
+    if (purpose === "reset" && user) {
+      user.passwordResetOtpHash = hashOtp(otp);
+      user.passwordResetOtpExpiresAt = new Date(Date.now() + OTP_TTL_MS);
+      user.passwordResetOtpAttempts = 0;
+      await user.save();
+    }
+    const deliveryPhone = purpose === "signup" ? req.body?.phone : user?.phone;
+    const deliveryChannel = await sendOtpCode(normalizedEmail, otp, purpose, deliveryPhone);
+    return res.json({
+      success: true,
+      deliveryChannel,
+      message: `A 6-digit code was sent to your ${deliveryChannel}. It is valid for 5 minutes.`,
+    });
+  } catch (error) {
+    if (purpose !== "reset") await EmailOtp.deleteOne({ email: normalizedEmail, purpose }).catch(() => {});
+    console.error("Send OTP error:", error.message);
+    return res.status(503).json({
+      success: false,
+      error: "Could not send the email code. Check the address and try again.",
+    });
+  }
+});
+
+app.post("/api/auth/verify-otp", async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    return res.status(503).json({
+      success: false,
+      error: "Account service is waiting for its database connection. Please try again shortly.",
+    });
+  }
+  const purpose = String(req.body?.purpose || "").trim().toLowerCase();
+  const otp = String(req.body?.otp || "");
+  const normalizedEmail =
+    typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+  if (!["signup", "login"].includes(purpose) || !/^\S+@\S+\.\S+$/.test(normalizedEmail) || !/^\d{6}$/.test(otp)) {
+    return res.status(400).json({
+      success: false,
+      error: "Email, 6-digit code, and a valid purpose are required.",
+    });
+  }
+  const stored = await EmailOtp.findOne({ email: normalizedEmail, purpose });
+  if (!stored || stored.expiresAt <= new Date()) {
+    if (stored) await stored.deleteOne();
+    return res.status(400).json({
+      success: false,
+      error: "Code is invalid or expired. Request a new code.",
+    });
+  }
+  if (stored.attempts >= 5) {
+    await stored.deleteOne();
+    return res.status(429).json({
+      success: false,
+      error: "Too many incorrect attempts. Request a new code.",
+    });
+  }
+  const saved = Buffer.from(stored.otpHash, "hex");
+  const provided = Buffer.from(hashOtp(otp), "hex");
+  if (saved.length !== provided.length || !crypto.timingSafeEqual(saved, provided)) {
+    stored.attempts += 1;
+    await stored.save();
+    return res.status(400).json({
+      success: false,
+      error: "Incorrect code. Enter the latest email or text message code, or request a new one.",
+    });
+  }
+
+  try {
+    if (purpose === "signup") {
+      const pending = stored.pendingSignup;
+      if (!pending) {
+        await stored.deleteOne();
+        return res.status(400).json({ success: false, error: "Signup details expired. Start again." });
+      }
+      const user = await User.create({
+        name: pending.name,
+        email: normalizedEmail,
+        phone: pending.phone,
+        city: pending.city || "",
+      });
+      await stored.deleteOne();
+      const pUser = publicUser(user);
+      USERS_STORE.unshift({ ...pUser, createdAt: new Date() });
+      return res.status(201).json({ success: true, user: pUser, token: createToken(user) });
+    }
+
+    const user = await User.findOne({ email: normalizedEmail });
+    await stored.deleteOne();
+    if (!user) {
+      return res.status(404).json({ success: false, error: "No account found for this email." });
+    }
+    return res.json({ success: true, user: publicUser(user), token: createToken(user) });
+  } catch (error) {
+    if (error.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        error: "An account with this email already exists.",
+      });
+    }
+    console.error("Verify OTP error:", error.message);
+    return res.status(500).json({ success: false, error: "Unable to verify the code right now." });
   }
 });
 
@@ -508,7 +782,7 @@ app.post("/api/auth/forgot-password", async (req, res) => {
         .createHash("sha256")
         .update(otp)
         .digest("hex");
-      user.passwordResetOtpExpiresAt = new Date(Date.now() + 60 * 1000);
+      user.passwordResetOtpExpiresAt = new Date(Date.now() + OTP_TTL_MS);
       user.passwordResetOtpAttempts = 0;
       await user.save();
       await mailTransport.sendMail({
@@ -662,6 +936,7 @@ app.get("/api/health", (req, res) => {
         ? "disconnected"
         : "in-memory-fallback",
     smtp: smtpStatus,
+    otpDelivery: smsOtpConfigured ? "sms" : mailTransport && mailFrom ? "email" : "not_configured",
     uptimeSeconds: Math.round(process.uptime()),
     geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
     geminiStatus,
@@ -2378,7 +2653,7 @@ Citizen Query: "${query}"`;
 // =========================================================================
 
 // Search Hospitals Endpoint (Natural Language Disease + Location + Budget)
-app.post("/api/hospitals/search", async (req, res) => {
+app.post("/api/hospitals/search", authenticate, async (req, res) => {
   const query =
     typeof req.body?.query === "string" ? req.body.query.trim() : "";
   const cityOverride =
@@ -2460,7 +2735,9 @@ app.post("/api/hospitals/search", async (req, res) => {
       (intent.secondarySpecialties || []).map((s) => s.toLowerCase()),
     );
 
-    let matchedHospitals = HOSPITALS.map((h) => {
+    let matchedHospitals = HOSPITALS.filter((h) =>
+      Number.isFinite(Number(h.coordinates?.lat)) && Number.isFinite(Number(h.coordinates?.lng)),
+    ).map((h) => {
       const distance =
         Math.round(
           haversineKm(
@@ -2600,7 +2877,7 @@ app.get("/api/hospitals/nearby", async (req, res) => {
   const distanceFromUser = (hospitalLat, hospitalLng) =>
     haversineKm(lat, lng, hospitalLat, hospitalLng);
   const registry = HOSPITALS
-    .filter((hospital) => Number(hospital.emergencyBedsAvailable) > 0)
+    .filter((hospital) => Number(hospital.emergencyBedsAvailable) > 0 && Number.isFinite(Number(hospital.coordinates?.lat)) && Number.isFinite(Number(hospital.coordinates?.lng)))
     .map((hospital) => ({
       ...hospital,
       lat: hospital.coordinates.lat,
@@ -2681,7 +2958,6 @@ app.get("/api/hospitals/nearby", async (req, res) => {
 });
 
 app.get("/api/hospitals", (req, res) => {
-  try {
   const specialty = typeof req.query.specialty === "string" ? req.query.specialty.trim().slice(0, 100) : "";
   const maxCost = req.query.maxCost;
   const minRating = req.query.minRating;
@@ -2714,8 +2990,8 @@ app.get("/api/hospitals", (req, res) => {
   let list = [...HOSPITALS];
 
   if (specialty && specialty !== "all") {
-      list = list.filter((h) =>
-        (h.specialties || []).some((s) =>
+    list = list.filter((h) =>
+      (h.specialties || []).some((s) =>
         s.toLowerCase().includes(specialty.toLowerCase()),
       ),
     );
@@ -2725,8 +3001,8 @@ app.get("/api/hospitals", (req, res) => {
     const c = canonicalCityName(city);
     list = list.filter(
       (h) =>
-          canonicalCityName(h.city || "").includes(c) ||
-          canonicalCityName(h.location || "").includes(c),
+        canonicalCityName(h.city).includes(c) ||
+        canonicalCityName(h.location).includes(c),
     );
   }
 
@@ -2755,28 +3031,91 @@ app.get("/api/hospitals", (req, res) => {
   return res.json({
     success: true,
     count: list.length,
-    hospitals: list.filter(Boolean).map((hospital) => {
-      const lat = Number(hospital.coordinates?.lat);
-      const lng = Number(hospital.coordinates?.lng);
-      const hasCoordinates = Number.isFinite(lat) && Number.isFinite(lng);
-      const mapUrl = hasCoordinates
-        ? `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`
-        : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(hospital.name || hospital.location || hospital.city || "hospital")}`;
+    hospitals: list.map((h) => {
+      const lat = Number(h.coordinates?.lat);
+      const lng = Number(h.coordinates?.lng);
+      const hasCoordinates = Number.isFinite(lat) && Math.abs(lat) <= 90 && Number.isFinite(lng) && Math.abs(lng) <= 180;
       return {
-        ...hospital,
-        lat: hasCoordinates ? lat : null,
-        lon: hasCoordinates ? lng : null,
-        ...(hasCoordinates && Number.isFinite(referenceLat) && Number.isFinite(referenceLng)
-          ? { distanceKm: Math.round(haversineKm(referenceLat, referenceLng, lat, lng) * 10) / 10 }
-          : {}),
-        mapUrl,
+        ...h,
+        ...(hasCoordinates ? {
+          lat,
+          lon: lng,
+          ...(Number.isFinite(referenceLat) && Number.isFinite(referenceLng)
+            ? { distanceKm: Math.round(haversineKm(referenceLat, referenceLng, lat, lng) * 10) / 10 }
+            : {}),
+          mapUrl: `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`,
+        } : {}),
       };
     }),
   });
-  } catch (error) {
-    console.error("Hospital directory request failed:", error);
-    return res.status(500).json({ success: false, error: "The hospital directory is temporarily unavailable." });
+});
+
+app.get("/api/location/resolve", async (req, res) => {
+  const lat = Number(req.query.lat);
+  const lng = Number(req.query.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+    return res.status(400).json({ success: false, error: "Enable location and send valid GPS coordinates." });
   }
+  const resolved = await resolveCityFromCoords(lat, lng);
+  return res.json({ success: true, ...resolved, lat, lng });
+});
+
+app.get("/api/location/geocode", (req, res) => {
+  const requestedCity = String(req.query.city || "").trim().slice(0, 100);
+  if (requestedCity.length < 2) {
+    return res.status(400).json({ success: false, error: "Enter a city name." });
+  }
+  const normalized = canonicalCityName(requestedCity);
+  const match = Object.entries(CITY_COORDINATES).find(([key]) =>
+    canonicalCityName(key) === normalized || normalized.includes(canonicalCityName(key)),
+  );
+  if (!match) {
+    return res.status(404).json({ success: false, error: "We do not have map coordinates for this city yet." });
+  }
+  const [key, place] = match;
+  return res.json({ success: true, city: place.name || key, lat: place.lat, lng: place.lng, approximate: true });
+});
+
+app.get("/api/schemes", authenticate, async (req, res) => {
+  const lat = Number(req.query.lat);
+  const lng = Number(req.query.lng);
+  let city = String(req.query.city || "").trim().slice(0, 100);
+  let resolved = null;
+  if ((!city || city.length < 2) && Number.isFinite(lat) && Number.isFinite(lng)) {
+    resolved = await resolveCityFromCoords(lat, lng);
+    city = resolved.city || city;
+  }
+  if (!city) {
+    return res.status(400).json({
+      success: false,
+      error: "Enable location or enter a city to see government schemes.",
+    });
+  }
+  const schemes = schemesForCity(city).map((scheme) => {
+    const localHospitals = HOSPITALS.filter((hospital) => {
+      const place = `${hospital.city || ""} ${hospital.location || ""}`.toLowerCase();
+      const cityMatch = place.includes(city.toLowerCase());
+      const schemeMatch = (hospital.insuranceAccepted || []).some((item) =>
+        scheme.match.some((term) => String(item).toLowerCase().includes(term)),
+      );
+      return cityMatch && (scheme.id === "pm-jay" || scheme.id === "cghs" || schemeMatch || cityMatch);
+    }).slice(0, 8);
+    return {
+      id: scheme.id,
+      name: scheme.name,
+      coverage: scheme.coverage,
+      helpline: scheme.helpline,
+      url: scheme.url,
+      hospitalCount: localHospitals.length,
+    };
+  });
+  return res.json({
+    success: true,
+    city,
+    state: resolved?.state || stateForCity(city),
+    address: resolved?.address || "",
+    schemes,
+  });
 });
 
 app.use("/api/cost-estimate", createCostEstimateRouter({ hospitals: HOSPITALS, authenticate }));
@@ -2786,7 +3125,7 @@ app.use("/api/cost-estimate", createCostEstimateRouter({ hospitals: HOSPITALS, a
 // Multi-turn context, empathetic medical triage, dynamic hospital integration
 // =========================================================================
 
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", authenticate, async (req, res) => {
   const { location, city, history, language: requestedLanguage } = req.body || {};
   const messageInput =
     typeof req.body?.message === "string" && req.body.message.trim()
@@ -3595,7 +3934,7 @@ app.use((error, req, res, next) => {
   const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 600
     ? error.status
     : 500;
-  if (status >= 500) console.error("Unhandled API error:", error.message);
+  if (status >= 500) console.error("Unhandled API error:", error.stack || error.message);
   const message = status === 413
     ? "Request body is too large."
     : status === 400

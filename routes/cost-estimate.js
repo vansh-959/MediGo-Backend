@@ -39,6 +39,15 @@ function isLocal(hospital, city) {
   return normalizeCity(hospital.city).includes(target) || normalizeCity(hospital.location).includes(target);
 }
 
+function distanceKm(origin, destination) {
+  if (!origin || !destination) return null;
+  const radians = (value) => (value * Math.PI) / 180;
+  const dLat = radians(destination.lat - origin.lat);
+  const dLng = radians(destination.lng - origin.lng);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(radians(origin.lat)) * Math.cos(radians(destination.lat)) * Math.sin(dLng / 2) ** 2;
+  return Math.round(6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)) * 10) / 10;
+}
+
 function selectDemoCost(procedure, scheme) {
   return {
     procedureKey: procedure.procedureKey,
@@ -85,23 +94,17 @@ function createCostEstimateRouter({ hospitals, authenticate }) {
     const city = String(req.query.city || "").trim().slice(0, 100);
     const procedure = matchProcedure(req.query.procedure);
     const localHospitals = hospitals.filter((hospital) => isLocal(hospital, city));
-    const hospitalSchemes = new Set(localHospitals.flatMap((hospital) => hospital.insuranceAccepted || []));
     const rateSchemes = new Set(SCHEMES);
     if (mongoose.connection.readyState === 1 && procedure) {
       try {
         const query = { active: true, procedureKey: procedure.procedureKey };
         if (city) query.city = { $in: [new RegExp("^" + city.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i"), "", null] };
-        (await ProcedureCost.distinct("scheme", query)).forEach((scheme) => rateSchemes.add(scheme));
+        (await ProcedureCost.distinct("scheme", query)).filter((scheme) => SCHEMES.has(scheme)).forEach((scheme) => rateSchemes.add(scheme));
       } catch (error) {
         console.warn("Could not load city scheme options:", error.message);
       }
     }
-    const schemes = [...new Set([...rateSchemes].filter((scheme) =>
-      !city || [...hospitalSchemes].some((available) =>
-        String(available).toLowerCase().includes(String(scheme).toLowerCase()) ||
-        String(scheme).toLowerCase().includes(String(available).toLowerCase()),
-      ),
-    ))];
+    const schemes = [...rateSchemes];
     return res.json({
       success: true,
       procedures: DEMO_PROCEDURE_COSTS.map(({ procedureKey, procedureName, unit }) => ({
@@ -116,6 +119,9 @@ function createCostEstimateRouter({ hospitals, authenticate }) {
 
   router.post("/", authenticate, async (req, res) => {
     const { procedureKey, city, isBeneficiary, scheme } = req.body || {};
+    const lat = Number(req.body?.lat);
+    const lng = Number(req.body?.lng);
+    const origin = Number.isFinite(lat) && Math.abs(lat) <= 90 && Number.isFinite(lng) && Math.abs(lng) <= 180 ? { lat, lng } : null;
     const procedure = PROCEDURES.get(String(procedureKey || "")) || matchProcedure(procedureKey);
     const selectedCity = String(city || "").trim().slice(0, 100);
     const beneficiary = isBeneficiary === true;
@@ -167,11 +173,11 @@ function createCostEstimateRouter({ hospitals, authenticate }) {
         : 0;
 
       const acceptingHospitals = hospitals
-        .filter((hospital) =>
-          hospital.specialties?.some((specialty) =>
-            String(specialty).toLowerCase().includes(procedure.specialty.toLowerCase()),
-          ),
-        )
+        .filter((hospital) => hospital.specialties?.some((specialty) => {
+          const listed = String(specialty).toLowerCase();
+          const expected = procedure.specialty.toLowerCase();
+          return listed.includes(expected) || (expected === "general medicine" && /general surgery|general medicine/.test(listed));
+        }))
         .filter((hospital) => isLocal(hospital, selectedCity))
         .filter((hospital) => !beneficiary || acceptsScheme(hospital, selectedScheme))
         .filter((hospital) => {
@@ -182,13 +188,20 @@ function createCostEstimateRouter({ hospitals, authenticate }) {
             ),
           );
         })
-        .map((hospital) => ({
+        .map((hospital) => {
+          const hospitalLat = Number(hospital.coordinates?.lat);
+          const hospitalLng = Number(hospital.coordinates?.lng);
+          const distance = Number.isFinite(hospitalLat) && Number.isFinite(hospitalLng)
+            ? distanceKm(origin, { lat: hospitalLat, lng: hospitalLng })
+            : null;
+          return {
           id: hospital.id,
           name: hospital.name,
           city: hospital.city,
           location: hospital.location,
           phone: hospital.phone,
           rating: hospital.rating,
+          distanceKm: distance,
           schemeAccepted: beneficiary ? selectedScheme : null,
           procedurePackageListed: Array.isArray(hospital.empaneledPackages) && hospital.empaneledPackages.some((item) =>
             [procedure.procedureKey, estimateCost.packageCode].some((code) =>
@@ -196,7 +209,8 @@ function createCostEstimateRouter({ hospitals, authenticate }) {
             ),
           ),
           mapUrl: `https://www.google.com/maps/dir/?api=1&destination=${hospital.coordinates.lat},${hospital.coordinates.lng}`,
-        }))
+        };})
+        .sort((a, b) => origin ? (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity) : (b.rating ?? 0) - (a.rating ?? 0))
         .slice(0, 12);
 
       return res.json({
