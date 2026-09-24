@@ -127,6 +127,7 @@ app.use((req, res, next) => {
     `http://localhost:${PORT}`,
     `http://127.0.0.1:${PORT}`,
     "https://medi-go-frontend.vercel.app",
+    "https://medi-go-frontend-gr0t3x06-vansh-959s-projects.vercel.app",
   ]);
 
   const isLocalPreview = origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
@@ -2680,6 +2681,7 @@ app.get("/api/hospitals/nearby", async (req, res) => {
 });
 
 app.get("/api/hospitals", (req, res) => {
+  try {
   const specialty = typeof req.query.specialty === "string" ? req.query.specialty.trim().slice(0, 100) : "";
   const maxCost = req.query.maxCost;
   const minRating = req.query.minRating;
@@ -2712,8 +2714,8 @@ app.get("/api/hospitals", (req, res) => {
   let list = [...HOSPITALS];
 
   if (specialty && specialty !== "all") {
-    list = list.filter((h) =>
-      h.specialties.some((s) =>
+      list = list.filter((h) =>
+        (h.specialties || []).some((s) =>
         s.toLowerCase().includes(specialty.toLowerCase()),
       ),
     );
@@ -2723,8 +2725,8 @@ app.get("/api/hospitals", (req, res) => {
     const c = canonicalCityName(city);
     list = list.filter(
       (h) =>
-        canonicalCityName(h.city).includes(c) ||
-        canonicalCityName(h.location).includes(c),
+          canonicalCityName(h.city || "").includes(c) ||
+          canonicalCityName(h.location || "").includes(c),
     );
   }
 
@@ -2733,10 +2735,10 @@ app.get("/api/hospitals", (req, res) => {
   );
   const referenceLat = Number.isFinite(requestedLat) && Math.abs(requestedLat) <= 90
     ? requestedLat
-    : cityMatch?.[1].lat;
+    : cityMatch?.[1]?.lat;
   const referenceLng = Number.isFinite(requestedLng) && Math.abs(requestedLng) <= 180
     ? requestedLng
-    : cityMatch?.[1].lng;
+    : cityMatch?.[1]?.lng;
 
   if (maxCost) {
     list = list.filter((h) => h.avgConsultationCost <= Number(maxCost));
@@ -2753,16 +2755,28 @@ app.get("/api/hospitals", (req, res) => {
   return res.json({
     success: true,
     count: list.length,
-    hospitals: list.map((h) => ({
-      ...h,
-      lat: h.coordinates.lat,
-      lon: h.coordinates.lng,
-      ...(Number.isFinite(referenceLat) && Number.isFinite(referenceLng)
-        ? { distanceKm: Math.round(haversineKm(referenceLat, referenceLng, h.coordinates.lat, h.coordinates.lng) * 10) / 10 }
-        : {}),
-      mapUrl: `https://www.google.com/maps/dir/?api=1&destination=${h.coordinates.lat},${h.coordinates.lng}`,
-    })),
+    hospitals: list.filter(Boolean).map((hospital) => {
+      const lat = Number(hospital.coordinates?.lat);
+      const lng = Number(hospital.coordinates?.lng);
+      const hasCoordinates = Number.isFinite(lat) && Number.isFinite(lng);
+      const mapUrl = hasCoordinates
+        ? `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`
+        : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(hospital.name || hospital.location || hospital.city || "hospital")}`;
+      return {
+        ...hospital,
+        lat: hasCoordinates ? lat : null,
+        lon: hasCoordinates ? lng : null,
+        ...(hasCoordinates && Number.isFinite(referenceLat) && Number.isFinite(referenceLng)
+          ? { distanceKm: Math.round(haversineKm(referenceLat, referenceLng, lat, lng) * 10) / 10 }
+          : {}),
+        mapUrl,
+      };
+    }),
   });
+  } catch (error) {
+    console.error("Hospital directory request failed:", error);
+    return res.status(500).json({ success: false, error: "The hospital directory is temporarily unavailable." });
+  }
 });
 
 app.use("/api/cost-estimate", createCostEstimateRouter({ hospitals: HOSPITALS, authenticate }));
