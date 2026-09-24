@@ -83,7 +83,7 @@ if (mailTransport && mailFrom) {
       console.error(`SMTP connection failed: ${error.code || error.name}`);
     });
 } else {
-  console.warn("SMTP not configured: password-reset OTP emails are disabled.");
+  console.warn("SMTP not configured: email OTP delivery is disabled.");
 }
 
 const connectDB = async () => {
@@ -430,6 +430,11 @@ const requireSiteOwner = (req, res, next) => {
 };
 
 app.post("/api/auth/signup", async (req, res) => {
+  return res.status(410).json({
+    success: false,
+    error: "Direct signup is disabled. Request and verify a one-time code to create an account.",
+  });
+
   if (mongoose.connection.readyState !== 1) {
     return res.status(503).json({
       success: false,
@@ -500,6 +505,11 @@ app.post("/api/auth/signup", async (req, res) => {
 });
 
 app.post("/api/auth/login", async (req, res) => {
+  return res.status(410).json({
+    success: false,
+    error: "Password sign-in is disabled. Request and verify a one-time code instead.",
+  });
+
   if (mongoose.connection.readyState !== 1) {
     return res.status(503).json({
       success: false,
@@ -554,8 +564,8 @@ app.post("/api/auth/send-otp", async (req, res) => {
     });
   }
   const purpose = String(req.body?.purpose || "").trim().toLowerCase();
-  if (!["signup", "login", "reset"].includes(purpose)) {
-    return res.status(400).json({ success: false, error: "Choose signup, login, or reset." });
+  if (!["signup", "login"].includes(purpose)) {
+    return res.status(400).json({ success: false, error: "Choose signup or login." });
   }
   const normalizedEmail =
     typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
@@ -738,6 +748,8 @@ app.post("/api/auth/verify-otp", async (req, res) => {
 });
 
 app.post("/api/auth/forgot-password", async (req, res) => {
+  return res.status(410).json({ success: false, error: "MediGo uses one-time sign-in codes and does not use account passwords." });
+
   if (mongoose.connection.readyState !== 1) {
     return res.status(503).json({
       success: false,
@@ -804,6 +816,8 @@ app.post("/api/auth/forgot-password", async (req, res) => {
 });
 
 app.post("/api/auth/reset-password", async (req, res) => {
+  return res.status(410).json({ success: false, error: "MediGo uses one-time sign-in codes and does not use account passwords." });
+
   if (mongoose.connection.readyState !== 1) {
     return res.status(503).json({
       success: false,

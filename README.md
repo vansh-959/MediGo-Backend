@@ -35,7 +35,7 @@ Add these values to `.env` when you use the related feature:
 
 - `MONGODB_URI` — stores accounts, email verification codes, and reviewed cost data.
 - `JWT_SECRET` — protects signed-in sessions. Use a long, private value.
-- `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, and `SMTP_FROM` — sends email login codes and password reset codes. `SMTP_URL` can be used instead.
+- `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, and `SMTP_FROM` — sends email sign-in codes. `SMTP_URL` can be used instead.
 - `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_FROM_NUMBER` — optional SMS delivery for signup and login codes.
 - `GEMINI_API_KEY` — enables AI chat and report reading.
 - `GEOAPIFY_API_KEY` — optional, helps turn GPS coordinates into a readable address.
@@ -45,7 +45,7 @@ Keep `.env` private. Do not put these keys in frontend JavaScript.
 
 ## Sign-in codes
 
-Login and signup codes are sent by email. To send them by SMS instead, set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_FROM_NUMBER`; include the country code in the phone number (for example, `+91`). Password reset codes continue to use email. The server saves a hashed code in MongoDB for up to five minutes, limits wrong attempts, and accepts only the latest code. MongoDB and at least one delivery method (SMTP or Twilio) must be available.
+Login and signup use a one-time code. Codes are sent by email. To send them by SMS instead, set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_FROM_NUMBER`; include the country code in the phone number (for example, `+91`). The server saves a hashed code in MongoDB for up to five minutes, limits wrong attempts, and accepts only the latest code. MongoDB and at least one delivery method (SMTP or Twilio) must be available.
 
 ## Location and maps
 
